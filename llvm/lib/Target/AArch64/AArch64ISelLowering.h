@@ -55,6 +55,12 @@ const unsigned StackProbeMaxLoopUnroll = 4;
 
 } // namespace AArch64
 
+namespace AArch64 {
+
+  bool isBitFieldInvertedMask(unsigned v);
+
+} // 
+
 namespace ARM64AS {
 enum : unsigned { PTR32_SPTR = 270, PTR32_UPTR = 271, PTR64 = 272 };
 }

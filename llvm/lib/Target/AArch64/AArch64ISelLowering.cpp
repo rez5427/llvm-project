@@ -19805,6 +19805,181 @@ static SDValue performANDORCSELCombine(SDNode *N, SelectionDAG &DAG) {
                      CSel0.getOperand(1), getCondCode(DAG, CC1), CCmp);
 }
 
+bool AArch64::isBitFieldInvertedMask(unsigned v) {
+  if (v == 0xffffffff)
+    return false;
+
+  // there can be 1's on either or both "outsides", all the "inside"
+  // bits must be 0's
+  return isShiftedMask_32(~v);
+}
+
+static SDValue PerformORCombineToBFI(SDNode *N,
+                                     TargetLowering::DAGCombinerInfo &DCI,
+                                     const AArch64Subtarget *Subtarget) {
+
+  EVT VT = N->getValueType(0);
+  SDValue N0 = N->getOperand(0);
+  SDValue N1 = N->getOperand(1);
+  SelectionDAG &DAG = DCI.DAG;
+  SDLoc DL(N);
+  // 1) or (and A, mask), val => BFI A, val, mask  
+  //      iff (val & mask) == val
+  //
+  // 2) or (and A, mask), (and B, mask2) => BFI A, (lsr B, amt), mask
+  //  2a) iff isBitFieldInvertedMask(mask) && isBitFieldInvertedMask(~mask2)
+  //          && mask == ~mask2
+  //  2b) iff isBitFieldInvertedMask(~mask) && isBitFieldInvertedMask(mask2)
+  //          && ~mask == mask2
+  //  (i.e., copy a bitfield value into another bitfield of the same width)
+
+  if (VT != MVT::i32 && VT != MVT::i64)
+    return SDValue();
+
+  SDValue N00 = N0.getOperand(0);
+
+  // The value and the mask need to be constants so we can verify this is
+  // actually a bitfield set. If the mask is 0xffff, we can do better
+  // via a movt instruction, so don't use BFI in that case.
+  SDValue MaskOp = N0.getOperand(1);
+  ConstantSDNode *MaskC = dyn_cast<ConstantSDNode>(MaskOp);
+  if (!MaskC)
+    return SDValue();
+  unsigned Mask = MaskC->getZExtValue();
+  if (Mask == 0xffff)
+    return SDValue();
+  SDValue Res;
+  // Case (1): or (and A, mask), val => BFI A, val, mask
+  ConstantSDNode *N1C = dyn_cast<ConstantSDNode>(N1);
+  if (N1C) {
+    unsigned Val = N1C->getZExtValue();
+    if ((Val & ~Mask) != Val)
+      return SDValue();
+
+    if (AArch64::isBitFieldInvertedMask(Mask)) {
+      Val >>= llvm::countr_zero(~Mask);
+
+      // Calculate BFM parameters for BFI (following AArch64ISelDAGToDAG.cpp:3394)
+      unsigned LSB = llvm::countr_zero(~Mask);
+      unsigned Width = llvm::popcount(~Mask);
+      unsigned BitWidth = VT.getSizeInBits();
+      unsigned ImmR = (BitWidth - LSB) % BitWidth;
+      unsigned ImmS = Width - 1;
+
+      // Generate MOV instruction for the source value
+      unsigned MOVIOpc = VT == MVT::i32 ? AArch64::MOVi32imm : AArch64::MOVi64imm;
+      SDNode *MOVI = DAG.getMachineNode(MOVIOpc, DL, VT, 
+                                        DAG.getTargetConstant(Val, DL, VT));
+
+      // Generate BFM instruction (will print as BFI when ImmS < ImmR)
+      unsigned Opc = VT == MVT::i32 ? AArch64::BFMWri : AArch64::BFMXri;
+      SDValue Ops[] = {N00, SDValue(MOVI, 0), 
+                       DAG.getTargetConstant(ImmR, DL, VT),
+                       DAG.getTargetConstant(ImmS, DL, VT)};
+      Res = SDValue(DAG.getMachineNode(Opc, DL, VT, Ops), 0);
+
+      DCI.CombineTo(N, Res, false);
+      // Return value from the original node to inform the combiner than N is
+      // now dead.
+      return SDValue(N, 0);
+    }
+  } else if (N1.getOpcode() == ISD::AND) {
+    // case (2) or (and A, mask), (and B, mask2) => BFI A, (lsr B, amt), mask
+    ConstantSDNode *N11C = dyn_cast<ConstantSDNode>(N1.getOperand(1));
+    if (!N11C)
+      return SDValue();
+    unsigned Mask2 = N11C->getZExtValue();
+
+    // Mask and ~Mask2 (or reverse) must be equivalent for the BFI pattern
+    // as is to match.
+    if (AArch64::isBitFieldInvertedMask(Mask) &&
+        (Mask == ~Mask2)) {
+      // 2a
+      unsigned amt = llvm::countr_zero(Mask2);
+      Res = DAG.getNode(ISD::SRL, DL, VT, N1.getOperand(0),
+                        DAG.getConstant(amt, DL, MVT::i32));
+      
+      // Calculate BFM parameters for BFI (following AArch64ISelDAGToDAG.cpp:3394)
+      unsigned LSB = llvm::countr_zero(~Mask);
+      unsigned Width = llvm::popcount(~Mask);
+      unsigned BitWidth = VT.getSizeInBits();
+      unsigned ImmR = (BitWidth - LSB) % BitWidth;
+      unsigned ImmS = Width - 1;
+
+      // Generate BFM instruction (will print as BFI when ImmS < ImmR)
+      unsigned Opc = VT == MVT::i32 ? AArch64::BFMWri : AArch64::BFMXri;
+      SDValue Ops[] = {N00, Res,
+                       DAG.getTargetConstant(ImmR, DL, VT),
+                       DAG.getTargetConstant(ImmS, DL, VT)};
+      Res = SDValue(DAG.getMachineNode(Opc, DL, VT, Ops), 0);
+      
+      DCI.CombineTo(N, Res, false);
+      // Return value from the original node to inform the combiner than N is
+      // now dead.
+      return SDValue(N, 0);
+    } else if (AArch64::isBitFieldInvertedMask(~Mask) &&
+               (~Mask == Mask2)) {
+      // 2b
+      unsigned lsb = llvm::countr_zero(Mask);
+      Res = DAG.getNode(ISD::SRL, DL, VT, N00,
+                        DAG.getConstant(lsb, DL, MVT::i32));
+      
+      // Calculate BFM parameters for BFI with Mask2
+      unsigned LSB = llvm::countr_zero(~Mask2);
+      unsigned Width = llvm::popcount(~Mask2);
+      unsigned BitWidth = VT.getSizeInBits();
+      unsigned ImmR = (BitWidth - LSB) % BitWidth;
+      unsigned ImmS = Width - 1;
+
+      // Generate BFM instruction (will print as BFI when ImmS < ImmR)
+      unsigned Opc = VT == MVT::i32 ? AArch64::BFMWri : AArch64::BFMXri;
+      SDValue Ops[] = {N1.getOperand(0), Res,
+                       DAG.getTargetConstant(ImmR, DL, VT),
+                       DAG.getTargetConstant(ImmS, DL, VT)};
+      Res = SDValue(DAG.getMachineNode(Opc, DL, VT, Ops), 0);
+      
+      DCI.CombineTo(N, Res, false);
+      // Return value from the original node to inform the combiner than N is
+      // now dead.
+      return SDValue(N, 0);
+    }
+  }
+
+  if (DAG.MaskedValueIsZero(N1, MaskC->getAPIntValue()) &&
+      N00.getOpcode() == ISD::SHL && isa<ConstantSDNode>(N00.getOperand(1)) &&
+      AArch64::isBitFieldInvertedMask(~Mask)) {
+    // Case (3): or (and (shl A, #shamt), mask), B => BFM B, A, ~mask
+    // where lsb(mask) == #shamt and masked bits of B are known zero.
+    SDValue ShAmt = N00.getOperand(1);
+    unsigned ShAmtC = ShAmt->getAsZExtVal();
+    unsigned LSB = llvm::countr_zero(Mask);
+    if (ShAmtC != LSB)
+      return SDValue();
+
+    // Calculate BFM parameters for BFI with ~Mask
+    unsigned InvMask = ~Mask;
+    unsigned LSB_inv = llvm::countr_zero(~InvMask);
+    unsigned Width = llvm::popcount(~InvMask);
+    unsigned BitWidth = VT.getSizeInBits();
+    unsigned ImmR = (BitWidth - LSB_inv) % BitWidth;
+    unsigned ImmS = Width - 1;
+
+    // Generate BFM instruction (will print as BFI when ImmS < ImmR)
+    unsigned Opc = VT == MVT::i32 ? AArch64::BFMWri : AArch64::BFMXri;
+    SDValue Ops[] = {N1, N00.getOperand(0),
+                     DAG.getTargetConstant(ImmR, DL, VT),
+                     DAG.getTargetConstant(ImmS, DL, VT)};
+    Res = SDValue(DAG.getMachineNode(Opc, DL, VT, Ops), 0);
+
+    DCI.CombineTo(N, Res, false);
+    // Return value from the original node to inform the combiner than N is
+    // now dead.
+    return SDValue(N, 0);
+  }
+
+  return SDValue();
+}
+
 static SDValue performORCombine(SDNode *N, TargetLowering::DAGCombinerInfo &DCI,
                                 const AArch64Subtarget *Subtarget,
                                 const AArch64TargetLowering &TLI) {
@@ -19812,6 +19987,14 @@ static SDValue performORCombine(SDNode *N, TargetLowering::DAGCombinerInfo &DCI,
 
   if (SDValue R = performANDORCSELCombine(N, DAG))
     return R;
+
+  SDValue N0 = N->getOperand(0);
+  SDValue N1 = N->getOperand(1);
+  
+  if (N0.getOpcode() == ISD::AND && N0.hasOneUse()) {
+    if (SDValue Res = PerformORCombineToBFI(N, DCI, Subtarget))
+      return Res;
+  }
 
   return SDValue();
 }
